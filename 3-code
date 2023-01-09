@@ -1,0 +1,1402 @@
+
+.idea/
+__pycache__/
+
+*.ipynb
+
+# dirs
+samples/
+logs/
+models/
+
+
+
+
+
+
+
+
+import argparse
+	import glob
+	import torch
+	import librosa
+	import numpy as np
+	import os
+	from os.path import join, basename
+	from shutil import copy
+	from data_loader import to_categorical
+	from model import Generator
+	from utils import world_decompose, pitch_conversion, world_encode_spectral_envelop, world_speech_synthesis, wav_padding
+	
+	
+	class ConvertDataset(object):
+	"""Dataset for conversion."""
+	def __init__(self, config, src_spk, trg_spk):
+	speakers = config.speakers
+	spk2idx = dict(zip(speakers, range(len(speakers))))
+	assert trg_spk in speakers, f'The trg_spk should be chosen from {speakers}, but you choose {trg_spk}.'
+	
+	self.src_spk = src_spk
+	self.trg_spk = trg_spk
+	
+	# Source speaker locations.
+	self.src_spk_stats = np.load(join(config.train_data_dir, f'{self.src_spk}_stats.npz'))
+	self.src_wav_dir = f'{config.wav_dir}/{self.src_spk}'
+	self.trg_wav_dir = f'{config.wav_dir}/{self.trg_spk}'
+	self.src_wav_files = sorted(glob.glob(join(self.src_wav_dir, '*.wav')))
+	self.trg_wav_files = sorted(glob.glob(join(self.trg_wav_dir, '*.wav')))
+	
+	# Target speaker locations.
+	self.trg_spk_stats = np.load(join(config.train_data_dir, f'{self.trg_spk}_stats.npz'))
+	
+	self.logf0s_mean_src = self.src_spk_stats['log_f0s_mean']
+	self.logf0s_std_src = self.src_spk_stats['log_f0s_std']
+	self.logf0s_mean_trg = self.trg_spk_stats['log_f0s_mean']
+	self.logf0s_std_trg = self.trg_spk_stats['log_f0s_std']
+	self.mcep_mean_src = self.src_spk_stats['coded_sps_mean']
+	self.mcep_std_src = self.src_spk_stats['coded_sps_std']
+	self.mcep_mean_trg = self.trg_spk_stats['coded_sps_mean']
+	self.mcep_std_trg = self.trg_spk_stats['coded_sps_std']
+	
+	self.spk_idx_src, self.spk_idx_trg = spk2idx[src_spk], spk2idx[trg_spk]
+	spk_cat_src = to_categorical([self.spk_idx_src], num_classes=len(speakers))
+	spk_cat_trg = to_categorical([self.spk_idx_trg], num_classes=len(speakers))
+	self.spk_c_org = spk_cat_src
+	self.spk_c_trg = spk_cat_trg
+	
+	def get_batch_test_data(self, batch_size=4):
+	batch_data = []
+	i = 0
+	
+	while i != batch_size:
+	wav_file = self.src_wav_files[i]
+	filename = basename(wav_file)
+	num = filename.split('.')[0].split('_')[1]
+	
+	for j in range(len(self.trg_wav_files)):
+	trg_wav_file = self.trg_wav_files[j]
+	trg_filename = basename(trg_wav_file)
+	trg_num = trg_filename.split('.')[0].split('_')[1]
+	
+	if num == trg_num:
+	batch_data.append(wav_file)
+	break
+	elif j == len(self.trg_wav_files) - 1:
+	batch_size += 1
+	
+	i += 1
+	
+	return batch_data
+	
+	
+	def load_wav(wavfile, sr=16000):
+	wav, _ = librosa.load(wavfile, sr=sr, mono=True)
+	return wav_padding(wav, sr=sr, frame_period=5, multiple=4)
+	
+	
+	def convert(config):
+	os.makedirs(join(config.convert_dir, config.resume_model), exist_ok=True)
+	sampling_rate, num_mcep, frame_period = config.sampling_rate, 36, 5
+	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+	
+	# Restore model
+	print(f'Loading the trained models from step {config.resume_model}...')
+	generator = Generator(num_speakers=config.num_speakers).to(device)
+	g_path = join(config.model_save_dir, f'{config.resume_model}-G.ckpt')
+	generator.load_state_dict(torch.load(g_path, map_location=lambda storage, loc: storage))
+	
+	# for all possible speaker pairs in config.speakers
+	for i in range(0, len(config.speakers)):
+	for j in range(0, len(config.speakers)):
+	if i != j:
+	target_dir = join(config.convert_dir,
+	str(config.resume_model),
+	f'{config.speakers[i]}_to_{config.speakers[j]}')
+	
+	os.makedirs(target_dir, exist_ok=True)
+	
+	# Load speakers
+	data_loader = ConvertDataset(config, src_spk=config.speakers[i], trg_spk=config.speakers[j])
+	print('---------------------------------------')
+	print('Source: ', config.speakers[i], ' Target: ', config.speakers[j])
+	print('---------------------------------------')
+	
+	# Read a batch of testdata
+	src_test_wavfiles = data_loader.get_batch_test_data(batch_size=config.num_converted_wavs)
+	src_test_wavs = [load_wav(wavfile, sampling_rate) for wavfile in src_test_wavfiles]
+	
+	with torch.no_grad():
+	for idx, wav in enumerate(src_test_wavs):
+	print(f'({idx}), file length: {len(wav)}')
+	wav_name = basename(src_test_wavfiles[idx])
+	
+	# convert wav to mceps
+	f0, _, sp, ap = world_decompose(wav=wav, fs=sampling_rate, frame_period=frame_period)
+	f0_converted = pitch_conversion(f0=f0,
+	mean_log_src=data_loader.logf0s_mean_src,
+	std_log_src=data_loader.logf0s_std_src,
+	mean_log_target=data_loader.logf0s_mean_trg,
+	std_log_target=data_loader.logf0s_std_trg)
+	coded_sp = world_encode_spectral_envelop(sp=sp, fs=sampling_rate, dim=num_mcep)
+	print("Before being fed into G: ", coded_sp.shape)
+	coded_sp_norm = (coded_sp - data_loader.mcep_mean_src) / data_loader.mcep_std_src
+	coded_sp_norm_tensor = torch.FloatTensor(coded_sp_norm.T).unsqueeze_(0).unsqueeze_(1).to(device)
+	spk_conds = torch.FloatTensor(data_loader.spk_c_trg).to(device)
+	
+	# Include org_conds if using src and target domain codes.
+	org_conds = torch.FloatTensor(data_loader.spk_c_org).to(device)
+	
+	# generate converted speech
+	coded_sp_converted_norm = generator(coded_sp_norm_tensor, spk_conds).data.cpu().numpy()
+	coded_sp_converted = np.squeeze(coded_sp_converted_norm).T * data_loader.mcep_std_trg + data_loader.mcep_mean_trg
+	coded_sp_converted = np.ascontiguousarray(coded_sp_converted)
+	print("After being fed into G: ", coded_sp_converted.shape)
+	
+	# convert back to wav
+	wav_transformed = world_speech_synthesis(f0=f0_converted,
+	coded_sp=coded_sp_converted,
+	ap=ap,
+	fs=sampling_rate,
+	frame_period=frame_period)
+	wav_id = wav_name.split('.')[0]
+	
+	# SAVE TARGET SYNTHESIZED
+	librosa.output.write_wav(join(target_dir, f'{wav_id}-vcto-{data_loader.trg_spk}.wav'),
+	wav_transformed,
+	sampling_rate)
+	
+	# SAVE COPY OF TARGET REFERENCE
+	wav_num = wav_name.split('.')[0].split('_')[1]
+	copy(f'{config.wav_dir}/{config.speakers[j]}/{config.speakers[j]}_{wav_num}.wav', target_dir)
+	
+	
+	if __name__ == '__main__':
+	parser = argparse.ArgumentParser()
+	
+	# Model configuration.
+	parser.add_argument('--num_converted_wavs', type=int, default=8, help='Number of wavs to convert.')
+	parser.add_argument('--resume_model', type=str, default=None, help='Model to resume for testing.')
+	parser.add_argument('--speakers', type=str, nargs='+', required=True, help='Speakers to be converted.')
+	
+	# Directories.
+	parser.add_argument('--train_data_dir', type=str, default='./data/mc/train', help='Path to train data directory.')
+	parser.add_argument('--test_data_dir', type=str, default='./data/mc/test', help='Path to test data directory.')
+	parser.add_argument('--wav_dir', type=str, default="./data/VCTK-Corpus/wav16", help='Path to wav data directory.')
+	parser.add_argument('--model_save_dir', type=str, default='./models', help='Path to model save directory.')
+	parser.add_argument('--convert_dir', type=str, default='./converted', help='Patht to converted wavs directory.')
+	
+	parser.add_argument('--sampling_rate', type=int, default=22050, help='Sampling rate for converted wavs.')
+	
+	config = parser.parse_args()
+	
+	# no. of spks
+	config.num_speakers = len(config.speakers)
+	
+	print(config)
+	
+	if config.resume_model is None:
+	raise RuntimeError("Please specify the step number for resuming.")
+	if len(config.speakers) < 2:
+	raise RuntimeError("Need at least 2 speakers to convert audio.")
+	
+	convert(config)
+
+
+
+
+
+
+
+
+
+
+
+import os
+import argparse
+from solver import Solver
+from data_loader import get_loader, TestDataset
+from torch.backends import cudnn
+
+
+def str2bool(v):
+    return v.lower() in 'true'
+
+
+def main(config):
+    # For fast training.
+    cudnn.benchmark = True
+
+    # Create directories if not exist.
+    if not os.path.exists(config.log_dir):
+        os.makedirs(config.log_dir)
+    if not os.path.exists(config.model_save_dir):
+        os.makedirs(config.model_save_dir)
+    if not os.path.exists(config.sample_dir):
+        os.makedirs(config.sample_dir)
+
+    # TODO: remove hard coding of 'test' speakers
+    src_spk = config.speakers[0]
+    trg_spk = config.speakers[1]
+
+    # Data loader.
+    train_loader = get_loader(config.speakers, config.train_data_dir, config.batch_size, 'train', num_workers=config.num_workers)
+    # TODO: currently only used to output a sample whilst training
+    test_loader = TestDataset(config.speakers, config.test_data_dir, config.wav_dir, src_spk=src_spk, trg_spk=trg_spk)
+
+    # Solver for training and testing StarGAN.
+    solver = Solver(train_loader, test_loader, config)
+
+    if config.mode == 'train':
+        solver.train()
+
+    # elif config.mode == 'test':
+    #     solver.test()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+
+    # Model configuration.
+    parser.add_argument('--lambda_rec', type=float, default=10, help='weight for reconstruction loss')
+    parser.add_argument('--lambda_gp', type=float, default=5, help='weight for gradient penalty')
+    parser.add_argument('--lambda_id', type=float, default=5, help='weight for id mapping loss')
+    parser.add_argument('--sampling_rate', type=int, default=16000, help='sampling rate')
+
+    # Training configuration.
+    parser.add_argument('--batch_size', type=int, default=8, help='mini-batch size')
+    parser.add_argument('--num_iters', type=int, default=200000, help='number of total iterations for training D')
+    parser.add_argument('--num_iters_decay', type=int, default=100000, help='number of iterations for decaying lr')
+    parser.add_argument('--g_lr', type=float, default=0.0002, help='learning rate for G')
+    parser.add_argument('--d_lr', type=float, default=0.0001, help='learning rate for D')
+    parser.add_argument('--n_critic', type=int, default=5, help='number of D updates per each G update')
+    parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for Adam optimizer')
+    parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam optimizer')
+    parser.add_argument('--resume_iters', type=int, default=None, help='resume training from this step')
+
+    # Test configuration.
+    parser.add_argument('--test_iters', type=int, default=100000, help='test model from this step')
+
+    # Miscellaneous.
+    parser.add_argument('--num_workers', type=int, default=1)
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
+
+    # Directories.
+    parser.add_argument('--train_data_dir', type=str, default='./data/mc/train')
+    parser.add_argument('--test_data_dir', type=str, default='./data/mc/test')
+    parser.add_argument('--wav_dir', type=str, default="./data/VCTK-Corpus/wav16")
+    parser.add_argument('--log_dir', type=str, default='./logs')
+    parser.add_argument('--model_save_dir', type=str, default='./models')
+    parser.add_argument('--sample_dir', type=str, default='./samples')
+    parser.add_argument('--speakers', type=str, nargs='+', required=True, help='Speaker dir names.')
+
+    # Step size.
+    parser.add_argument('--log_step', type=int, default=10)
+    parser.add_argument('--sample_step', type=int, default=10000)
+    parser.add_argument('--model_save_step', type=int, default=10000)
+    parser.add_argument('--lr_update_step', type=int, default=1000)
+
+    config = parser.parse_args()
+
+    # no. of spks
+    config.num_speakers = len(config.speakers)
+
+    if len(config.speakers) < 2:
+        raise RuntimeError("Need at least 2 speakers to convert audio.")
+
+    print(config)
+    main(config)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+	import torch
+	import torch.nn as nn
+	import numpy as np
+	import argparse
+	from data_loader import get_loader, to_categorical
+	
+	
+	class ConditionalInstanceNormalisation(nn.Module):
+	"""AdaIN Block."""
+	
+	def __init__(self, dim_in, dim_c):
+	super(ConditionalInstanceNormalisation, self).__init__()
+	
+	self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+	
+	self.dim_in = dim_in
+	self.gamma_t = nn.Linear(dim_c, dim_in)
+	self.beta_t = nn.Linear(dim_c, dim_in)
+	
+	def forward(self, x, c_trg):
+	u = torch.mean(x, dim=2, keepdim=True)
+	var = torch.mean((x - u) * (x - u), dim=2, keepdim=True)
+	std = torch.sqrt(var + 1e-8)
+	
+	gamma = self.gamma_t(c_trg.to(self.device))
+	gamma = gamma.view(-1, self.dim_in, 1)
+	beta = self.beta_t(c_trg.to(self.device))
+	beta = beta.view(-1, self.dim_in, 1)
+	
+	h = (x - u) / std
+	h = h * gamma + beta
+	
+	return h
+	
+	
+	class ResidualBlock(nn.Module):
+	"""Residual Block with instance normalization."""
+	def __init__(self, dim_in, dim_out, style_num):
+	super(ResidualBlock, self).__init__()
+	self.conv = nn.Conv1d(dim_in, dim_out, kernel_size=3, stride=1, padding=1, bias=False)
+	self.cin = ConditionalInstanceNormalisation(dim_out, style_num)
+	self.glu = nn.GLU(dim=1)
+	
+	def forward(self, x, c):
+	x = self.conv(x)
+	x = self.cin(x, c)
+	x = self.glu(x)
+	
+	return x
+	
+	
+	class Generator(nn.Module):
+	"""Generator network."""
+	def __init__(self, num_speakers=4):
+	super(Generator, self).__init__()
+	# Down-sampling layers
+	self.down_sample_1 = nn.Sequential(
+	nn.Conv2d(in_channels=1, out_channels=128, kernel_size=(3, 9), padding=(1, 4), bias=False),
+	nn.GLU(dim=1)
+	)
+	self.down_sample_2 = nn.Sequential(
+	nn.Conv2d(in_channels=64, out_channels=256, kernel_size=(4, 8), stride=(2, 2), padding=(1, 3), bias=False),
+	nn.InstanceNorm2d(num_features=256, affine=True, track_running_stats=True),
+	nn.GLU(dim=1)
+	)
+	self.down_sample_3 = nn.Sequential(
+	nn.Conv2d(in_channels=128, out_channels=512, kernel_size=(4, 8), stride=(2, 2), padding=(1, 3), bias=False),
+	nn.InstanceNorm2d(num_features=512, affine=True, track_running_stats=True),
+	nn.GLU(dim=1)
+	)
+	
+	# Down-conversion layers.
+	self.down_conversion = nn.Sequential(
+	nn.Conv1d(in_channels=2304,
+	out_channels=256,
+	kernel_size=1,
+	stride=1,
+	padding=0,
+	bias=False),
+	nn.InstanceNorm1d(num_features=256, affine=True)
+	)
+	
+	# Bottleneck layers.
+	self.residual_1 = ResidualBlock(dim_in=256, dim_out=512, style_num=num_speakers)
+	self.residual_2 = ResidualBlock(dim_in=256, dim_out=512, style_num=num_speakers)
+	self.residual_3 = ResidualBlock(dim_in=256, dim_out=512, style_num=num_speakers)
+	self.residual_4 = ResidualBlock(dim_in=256, dim_out=512, style_num=num_speakers)
+	self.residual_5 = ResidualBlock(dim_in=256, dim_out=512, style_num=num_speakers)
+	self.residual_6 = ResidualBlock(dim_in=256, dim_out=512, style_num=num_speakers)
+	self.residual_7 = ResidualBlock(dim_in=256, dim_out=512, style_num=num_speakers)
+	self.residual_8 = ResidualBlock(dim_in=256, dim_out=512, style_num=num_speakers)
+	self.residual_9 = ResidualBlock(dim_in=256, dim_out=512, style_num=num_speakers)
+	
+	# Up-conversion layers.
+	self.up_conversion = nn.Conv1d(in_channels=256,
+	out_channels=2304,
+	kernel_size=1,
+	stride=1,
+	padding=0,
+	bias=False)
+	
+	# Up-sampling layers.
+	self.up_sample_1 = nn.Sequential(
+	nn.ConvTranspose2d(in_channels=256, out_channels=256, kernel_size=4, stride=2, padding=1, bias=False),
+	nn.InstanceNorm2d(num_features=256, affine=True, track_running_stats=True),
+	nn.GLU(dim=1)
+	)
+	self.up_sample_2 = nn.Sequential(
+	nn.ConvTranspose2d(in_channels=128, out_channels=128, kernel_size=4, stride=2, padding=1, bias=False),
+	nn.InstanceNorm2d(num_features=128, affine=True, track_running_stats=True),
+	nn.GLU(dim=1)
+	)
+	
+	# Out.
+	self.out = nn.Conv2d(in_channels=64, out_channels=1, kernel_size=7, stride=1, padding=3, bias=False)
+	
+	def forward(self, x, c):
+	width_size = x.size(3)
+	
+	x = self.down_sample_1(x)
+	x = self.down_sample_2(x)
+	x = self.down_sample_3(x)
+	
+	x = x.contiguous().view(-1, 2304, width_size // 4)
+	x = self.down_conversion(x)
+	
+	x = self.residual_1(x, c)
+	x = self.residual_2(x, c)
+	x = self.residual_3(x, c)
+	x = self.residual_4(x, c)
+	x = self.residual_5(x, c)
+	x = self.residual_6(x, c)
+	x = self.residual_7(x, c)
+	x = self.residual_8(x, c)
+	x = self.residual_9(x, c)
+	
+	x = self.up_conversion(x)
+	x = x.view(-1, 256, 9, width_size // 4)
+	
+	x = self.up_sample_1(x)
+	x = self.up_sample_2(x)
+	x = self.out(x)
+	
+	return x
+	
+	
+	class Discriminator(nn.Module):
+	"""Discriminator network."""
+	def __init__(self, num_speakers=10):
+	super(Discriminator, self).__init__()
+	
+	self.num_speakers = num_speakers
+	self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+	
+	# Initial layers.
+	self.conv_layer_1 = nn.Sequential(
+	nn.Conv2d(in_channels=1, out_channels=128, kernel_size=(3, 3), stride=(1, 1), padding=1),
+	nn.GLU(dim=1)
+	)
+	
+	# Down-sampling layers.
+	self.down_sample_1 = nn.Sequential(
+	nn.Conv2d(in_channels=64, out_channels=256, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False),
+	nn.InstanceNorm2d(num_features=256, affine=True, track_running_stats=True),
+	nn.GLU(dim=1)
+	)
+	self.down_sample_2 = nn.Sequential(
+	nn.Conv2d(in_channels=128, out_channels=512, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False),
+	nn.InstanceNorm2d(num_features=512, affine=True, track_running_stats=True),
+	nn.GLU(dim=1)
+	)
+	self.down_sample_3 = nn.Sequential(
+	nn.Conv2d(in_channels=256, out_channels=1024, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False),
+	nn.InstanceNorm2d(num_features=1024, affine=True, track_running_stats=True),
+	nn.GLU(dim=1)
+	)
+	self.down_sample_4 = nn.Sequential(
+	nn.Conv2d(in_channels=512, out_channels=1024, kernel_size=(1, 5), stride=(1, 1), padding=(0, 2), bias=False),
+	nn.InstanceNorm2d(num_features=1024, affine=True, track_running_stats=True),
+	nn.GLU(dim=1)
+	)
+	
+	# Fully connected layer.
+	self.fully_connected = nn.Linear(in_features=512, out_features=1)
+	
+	# Projection.
+	self.projection = nn.Linear(2*self.num_speakers, 512)
+	
+	def forward(self, x, c, c_):
+	c_onehot = torch.cat((c, c_), dim=1).to(self.device)
+	
+	x = self.conv_layer_1(x)
+	
+	x = self.down_sample_1(x)
+	x = self.down_sample_2(x)
+	x = self.down_sample_3(x)
+	x_ = self.down_sample_4(x)
+	
+	h = torch.sum(x_, dim=(2, 3))
+	x = self.fully_connected(x_.permute(0, 2, 3, 1)).permute(0, 3, 1, 2) # (b, 1, h, w)
+	p = self.projection(c_onehot) # (b, 512)
+	
+	in_prod = p * h
+	
+	x = x.view(x.size(0), -1)
+	x = torch.mean(x, dim=-1) + torch.mean(in_prod, dim=-1)
+	
+	return x
+	
+	
+	# Just for testing shapes of architecture.
+	if __name__ == '__main__':
+	train_dir = '../data/VCC2018-Data/mc/train'
+	num_speakers = 4
+	speakers_using = ['VCC2SM1', 'VCC2SM2', 'VCC2SF1', 'VCC2SF2']
+	
+	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+	
+	# Load models
+	generator = Generator(num_speakers=num_speakers).to(device)
+	discriminator = Discriminator(num_speakers=num_speakers).to(device)
+	
+	# Load data
+	train_loader = get_loader(speakers_using, train_dir, 8, 'train', num_workers=1)
+	data_iter = iter(train_loader)
+	
+	mc_real, _, spk_c_org = next(data_iter)
+	mc_real.unsqueeze_(1) # (B, D, T) -> (B, 1, D, T) for conv2d
+	
+	spk_c = np.random.randint(0, num_speakers, size=mc_real.size(0))
+	spk_c_cat = to_categorical(spk_c, num_speakers)
+	spk_c_trg = torch.FloatTensor(spk_c_cat)
+	
+	mc_real = mc_real.to(device) # Input mc.
+	spk_c_org = spk_c_org.to(device) # Original spk acc conditioning.
+	spk_c_trg = spk_c_trg.to(device) # Target spk conditioning.
+	
+	print('------------------------')
+	print('Testing Discriminator')
+	print('-------------------------')
+	print(f'Shape in: {mc_real.shape}')
+	dis_real = discriminator(mc_real, spk_c_org, spk_c_trg)
+	print(f'Shape out: {dis_real.shape}')
+	print('------------------------')
+	
+	print('Testing Generator')
+	print('-------------------------')
+	print(f'Shape in: {mc_real.shape}')
+	mc_fake = generator(mc_real, spk_c_trg)
+	print(f'Shape out: {mc_fake.shape}')
+	print('------------------------')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import sys
+	import argparse
+	import wave
+	from multiprocessing import cpu_count
+	from concurrent.futures import ProcessPoolExecutor
+	from functools import partial
+	from utils import *
+	from tqdm import tqdm
+	from sklearn.model_selection import train_test_split
+	import glob
+	from os.path import join, basename
+	import subprocess
+	
+	
+	def resample(spk_folder, sampling_rate, origin_wavpath, target_wavpath):
+	"""
+	Resample files to x frames and save to output dir.
+	:param spk_folder: speaker dir
+	:param sampling_rate: frame rate to resample to
+	:param origin_wavpath: root path of all speaker folders to resample
+	:param target_wavpath: root path of resampled speakers to output to
+	:return: None
+	"""
+	wavfiles = [i for i in os.listdir(join(origin_wavpath, spk_folder)) if i.endswith('.wav')]
+	for wav in wavfiles:
+	folder_to = join(target_wavpath, spk_folder)
+	os.makedirs(folder_to, exist_ok=True)
+	wav_to = join(folder_to, wav)
+	wav_from = join(origin_wavpath, spk_folder, wav)
+	subprocess.call(['sox', wav_from, '-r', str(sampling_rate), wav_to])
+	
+	return None
+	
+	
+	def resample_to_xk(sampling_rate, origin_wavpath, target_wavpath, num_workers=1):
+	"""
+	Prepare folders for resmapling at x frames.
+	:param sampling_rate: frame rate to resample to
+	:param origin_wavpath: root path of all speaker folders to resample
+	:param target_wavpath: root path of resampled speakers to output to
+	:param num_workers: cpu workers
+	:return: None
+	"""
+	os.makedirs(target_wavpath, exist_ok=True)
+	spk_folders = os.listdir(origin_wavpath)
+	print(f'> Using {num_workers} workers!')
+	executor = ProcessPoolExecutor(max_workers=num_workers)
+	
+	futures = []
+	for spk_folder in tqdm(spk_folders):
+	futures.append(executor.submit(partial(resample, spk_folder, sampling_rate, origin_wavpath, target_wavpath)))
+	
+	result_list = [future.result() for future in tqdm(futures)]
+	print('Completed:')
+	print(result_list)
+	
+	return None
+	
+	
+	def get_sampling_rate(file_name):
+	"""
+	Get the sampling rate of a wav file.
+	:param file_name: wav file path
+	:return: frame rate of wav file
+	"""
+	with wave.open(file_name, 'rb') as wave_file:
+	sample_rate = wave_file.getframerate()
+	
+	return sample_rate
+	
+	
+	def split_data(paths):
+	"""
+	Split path data into train test split.
+	:param paths: all wav paths of a speaker dir.
+	:return: train wav paths, test wav paths
+	"""
+	indices = np.arange(len(paths))
+	test_size = 0.1
+	train_indices, test_indices = train_test_split(indices, test_size=test_size, random_state=1234)
+	train_paths = list(np.array(paths)[train_indices])
+	test_paths = list(np.array(paths)[test_indices])
+	
+	return train_paths, test_paths
+	
+	
+	def get_spk_world_feats(spk_name, spk_paths, output_dir, sample_rate):
+	"""
+	Convert wav files to there MCEP features.
+	:param spk_name: name of speaker dir
+	:param spk_paths: paths of all wavs in speaker dir
+	:param output_dir: dir to output MCEPs to
+	:param sample_rate: frame rate of wav files
+	:return: None
+	"""
+	f0s = []
+	coded_sps = []
+	for wav_file in spk_paths:
+	f0, _, _, _, coded_sp = world_encode_wav(wav_file, fs=sample_rate)
+	f0s.append(f0)
+	coded_sps.append(coded_sp)
+	
+	log_f0s_mean, log_f0s_std = logf0_statistics(f0s)
+	coded_sps_mean, coded_sps_std = coded_sp_statistics(coded_sps)
+	
+	np.savez(join(output_dir, spk_name + '_stats.npz'),
+	log_f0s_mean=log_f0s_mean,
+	log_f0s_std=log_f0s_std,
+	coded_sps_mean=coded_sps_mean,
+	coded_sps_std=coded_sps_std)
+	
+	for wav_file in tqdm(spk_paths):
+	wav_name = basename(wav_file)
+	_, _, _, _, coded_sp = world_encode_wav(wav_file, fs=sample_rate)
+	normalised_coded_sp = (coded_sp - coded_sps_mean) / coded_sps_std
+	np.save(os.path.join(output_dir, wav_name.replace('.wav', '.npy')),
+	normalised_coded_sp,
+	allow_pickle=False)
+	
+	return None
+	
+	
+	def process_spk(spk_path, mc_dir):
+	"""
+	Prcoess speaker wavs to MCEPs
+	:param spk_path: path to speaker wav dir
+	:param mc_dir: output dir for speaker data
+	:return: None
+	"""
+	spk_paths = glob.glob(join(spk_path, '*.wav'))
+	
+	# find the sampling rate of teh wav files you are about to convert
+	sample_rate = get_sampling_rate(spk_paths[0])
+	
+	spk_name = basename(spk_path)
+	
+	get_spk_world_feats(spk_name, spk_paths, mc_dir, sample_rate)
+	
+	return None
+	
+	
+	def process_spk_with_split(spk_path, mc_dir_train, mc_dir_test):
+	"""
+	Perform train test split on a speaker and process wavs to MCEPs.
+	:param spk_path: path to speaker wav dir
+	:param mc_dir_train: output dir for speaker train data
+	:param mc_dir_test: output dir for speaker test data
+	:return: None
+	"""
+	spk_paths = glob.glob(join(spk_path, '*.wav'))
+	
+	# find the samplng rate of the wav files you are about to convert
+	sample_rate = get_sampling_rate(spk_paths[0])
+	
+	spk_name = basename(spk_path)
+	train_paths, test_paths = split_data(spk_paths)
+	
+	get_spk_world_feats(spk_name, train_paths, mc_dir_train, sample_rate)
+	get_spk_world_feats(spk_name, test_paths, mc_dir_test, sample_rate)
+	
+	return None
+	
+	
+	if __name__ == '__main__':
+	parser = argparse.ArgumentParser()
+	
+	perform_data_split_default = 'y'
+	
+	# If data_split needs to be peformed
+	origin_wavpath_default = "./data/VCTK-Corpus/wav48"
+	target_wavpath_default = "./data/VCTK-Corpus/wav16"
+	
+	# If data_split does NOT need to be peformed
+	origin_wavpath_train_default = ''
+	origin_wavpath_eval_default = ''
+	target_wavpath_train_default = './data/VCC2018-Corpus/wav22_train'
+	target_wavpath_eval_default = './data/VCC2018-Corpus/wav22_eval'
+	
+	# Location of processed mc files
+	mc_dir_train_default = './data/mc/train'
+	mc_dir_test_default = './data/mc/test'
+	
+	# DATA SPLITTING.
+	parser.add_argument('--perform_data_split', choices=['y', 'n'], default=perform_data_split_default,
+	help='Perform random data split.')
+	
+	# RESAMPLING.
+	parser.add_argument('--resample_rate', type=int, default=0, help='Resampling rate.')
+	
+	# if performing a data split:
+	parser.add_argument('--origin_wavpath', type=str, default=origin_wavpath_default,
+	help='Original wavpath for resampling.')
+	parser.add_argument('--target_wavpath', type=str, default=target_wavpath_default,
+	help='Target wavpath for resampling.')
+	
+	# if NOT performing a data split
+	parser.add_argument('--origin_wavpath_train', type=str, default=origin_wavpath_train_default,
+	help='Original wavpath for resampling train files.')
+	parser.add_argument('--origin_wavpath_eval', type=str, default=origin_wavpath_eval_default,
+	help='Original wavpath for resampling eval files.')
+	parser.add_argument('--target_wavpath_train', type=str, default=target_wavpath_train_default,
+	help='Target wavpath for resampling train files.')
+	parser.add_argument('--target_wavpath_eval', type=str, default=target_wavpath_eval_default,
+	help='Target wavpath for resampling eval files.')
+	
+	# MCEP PREPROCESSING.
+	parser.add_argument('--mc_dir_train', type=str, default=mc_dir_train_default, help='Dir for training features.')
+	parser.add_argument('--mc_dir_test', type=str, default=mc_dir_test_default, help='Dir for testing features.')
+	parser.add_argument('--speakers', type=str, nargs='+', required=True, help='Speakers to be processed.')
+	parser.add_argument('--num_workers', type=int, default=None, help='Number of cpus to use.')
+	
+	argv = parser.parse_args()
+	
+	perform_data_split = argv.perform_data_split
+	resample_rate = argv.resample_rate
+	origin_wavpath = argv.origin_wavpath
+	target_wavpath = argv.target_wavpath
+	origin_wavpath_train = argv.origin_wavpath_train
+	origin_wavpath_eval = argv.origin_wavpath_eval
+	target_wavpath_train = argv.target_wavpath_train
+	target_wavpath_eval = argv.target_wavpath_eval
+	mc_dir_train = argv.mc_dir_train
+	mc_dir_test = argv.mc_dir_test
+	speakers = argv.speakers
+	num_workers = argv.num_workers if argv.num_workers is not None else cpu_count()
+	
+	# Do resample.
+	if perform_data_split == 'n':
+	if resample_rate > 0:
+	print(f'Resampling speakers in {origin_wavpath_train} to {target_wavpath_train} at {resample_rate}')
+	resample_to_xk(resample_rate, origin_wavpath_train, target_wavpath_train, num_workers)
+	print(f'Resampling speakers in {origin_wavpath_eval} to {target_wavpath_eval} at {resample_rate}')
+	resample_to_xk(resample_rate, origin_wavpath_eval, target_wavpath_eval, num_workers)
+	else:
+	if resample_rate > 0:
+	print(f'Resampling speakers in {origin_wavpath} to {target_wavpath} at {resample_rate}')
+	resample_to_xk(resample_rate, origin_wavpath, target_wavpath, num_workers)
+	
+	print('Making directories for MCEPs...')
+	os.makedirs(mc_dir_train, exist_ok=True)
+	os.makedirs(mc_dir_test, exist_ok=True)
+	
+	num_workers = len(speakers)
+	print(f'Number of workers: {num_workers}')
+	executer = ProcessPoolExecutor(max_workers=num_workers)
+	
+	futures = []
+	if perform_data_split == 'n':
+	# current wavs working with (train)
+	working_train_dir = target_wavpath_train
+	for spk in tqdm(speakers):
+	print(speakers)
+	spk_dir = os.path.join(working_train_dir, spk)
+	futures.append(executer.submit(partial(process_spk, spk_dir, mc_dir_train)))
+	
+	# current wavs working with (eval)
+	working_eval_dir = target_wavpath_eval
+	for spk in tqdm(speakers):
+	spk_dir = os.path.join(working_eval_dir, spk)
+	futures.append(executer.submit(partial(process_spk, spk_dir, mc_dir_test)))
+	else:
+	# current wavs we are working with (all for data split)
+	working_dir = target_wavpath
+	for spk in tqdm(speakers):
+	spk_dir = os.path.join(working_dir, spk)
+	futures.append(executer.submit(partial(process_spk_with_split, spk_dir, mc_dir_train, mc_dir_test)))
+	
+	result_list = [future.result() for future in tqdm(futures)]
+	print('Completed:')
+	print(result_list)
+	
+	sys.exit(0)
+
+
+
+
+
+
+
+
+
+
+
+
+from model import Generator
+	from model import Discriminator
+	import torch
+	import torch.nn.functional as F
+	from os.path import join, basename
+	import time
+	import datetime
+	from data_loader import to_categorical
+	from utils import *
+	from tqdm import tqdm
+	from torch.utils.tensorboard import SummaryWriter
+	
+	
+	class Solver(object):
+	"""Solver for training and testing StarGAN."""
+	
+	def __init__(self, train_loader, test_loader, config):
+	"""Initialize configurations."""
+	
+	# Data loader.
+	self.train_loader = train_loader
+	self.test_loader = test_loader
+	self.sampling_rate = config.sampling_rate
+	
+	# Model configurations.
+	self.num_speakers = config.num_speakers
+	self.lambda_rec = config.lambda_rec
+	self.lambda_gp = config.lambda_gp
+	self.lambda_id = config.lambda_id
+	
+	# Training configurations.
+	self.batch_size = config.batch_size
+	self.num_iters = config.num_iters
+	self.num_iters_decay = config.num_iters_decay
+	self.g_lr = config.g_lr
+	self.d_lr = config.d_lr
+	self.n_critic = config.n_critic
+	self.beta1 = config.beta1
+	self.beta2 = config.beta2
+	self.resume_iters = config.resume_iters
+	
+	# Test configurations.
+	self.test_iters = config.test_iters
+	
+	# Miscellaneous.
+	self.logger = SummaryWriter(log_dir=config.log_dir)
+	self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+	
+	# Directories.
+	self.log_dir = config.log_dir
+	self.sample_dir = config.sample_dir
+	self.model_save_dir = config.model_save_dir
+	
+	# Step size.
+	self.log_step = config.log_step
+	self.sample_step = config.sample_step
+	self.model_save_step = config.model_save_step
+	self.lr_update_step = config.lr_update_step
+	
+	# Build the model and tensorboard.
+	self.build_model()
+	
+	def build_model(self):
+	"""Create a generator and a discriminator."""
+	self.generator = Generator(num_speakers=self.num_speakers)
+	self.discriminator = Discriminator(num_speakers=self.num_speakers)
+	
+	self.g_optimizer = torch.optim.Adam(self.generator.parameters(), self.g_lr, [self.beta1, self.beta2])
+	self.d_optimizer = torch.optim.Adam(self.discriminator.parameters(), self.d_lr, [self.beta1, self.beta2])
+	
+	self.print_network(self.generator, 'Generator')
+	self.print_network(self.discriminator, 'Discriminator')
+	
+	self.generator.to(self.device)
+	self.discriminator.to(self.device)
+	
+	def print_network(self, model, name):
+	"""Print out the network information."""
+	num_params = 0
+	for p in model.parameters():
+	num_params += p.numel()
+	print(model)
+	print(name)
+	print("The number of parameters: {}".format(num_params))
+	
+	def log_loss_tensorboard(self, loss_dict, step):
+	for k, v in loss_dict.items():
+	self.logger.add_scalar(k, v, step)
+	
+	def restore_model(self, resume_iters):
+	"""Restore the trained generator and discriminator."""
+	print('Loading the trained models from step {}...'.format(resume_iters))
+	g_path = os.path.join(self.model_save_dir, '{}-G.ckpt'.format(resume_iters))
+	d_path = os.path.join(self.model_save_dir, '{}-D.ckpt'.format(resume_iters))
+	
+	self.generator.load_state_dict(torch.load(g_path, map_location=lambda storage, loc: storage))
+	self.discriminator.load_state_dict(torch.load(d_path, map_location=lambda storage, loc: storage))
+	
+	def update_lr(self, g_lr, d_lr):
+	"""Decay learning rates of the generator and discriminator."""
+	for param_group in self.g_optimizer.param_groups:
+	param_group['lr'] = g_lr
+	for param_group in self.d_optimizer.param_groups:
+	param_group['lr'] = d_lr
+	
+	def reset_grad(self):
+	"""Reset the gradientgradient buffers."""
+	self.g_optimizer.zero_grad()
+	self.d_optimizer.zero_grad()
+	
+	def denorm(self, x):
+	"""Convert the range from [-1, 1] to [0, 1]."""
+	out = (x + 1) / 2
+	return out.clamp_(0, 1)
+	
+	def gradient_penalty(self, y, x):
+	"""Compute gradient penalty: (L2_norm(dy/dx) - 1)**2."""
+	weight = torch.ones(y.size()).to(self.device)
+	dydx = torch.autograd.grad(outputs=y,
+	inputs=x,
+	grad_outputs=weight,
+	retain_graph=True,
+	create_graph=True,
+	only_inputs=True)[0]
+	
+	dydx = dydx.view(dydx.size(0), -1)
+	dydx_l2norm = torch.sqrt(torch.sum(dydx**2, dim=1))
+	return torch.mean((dydx_l2norm-1)**2)
+	
+	def label2onehot(self, labels, dim):
+	"""Convert label indices to one-hot vectors."""
+	batch_size = labels.size(0)
+	out = torch.zeros(batch_size, dim)
+	out[np.arange(batch_size), labels.long()] = 1
+	return out
+	
+	def sample_spk_c(self, size):
+	spk_c = np.random.randint(0, self.num_speakers, size=size)
+	spk_c_cat = to_categorical(spk_c, self.num_speakers)
+	return torch.LongTensor(spk_c), torch.FloatTensor(spk_c_cat)
+	
+	def classification_loss(self, logit, target):
+	"""Compute softmax cross entropy loss."""
+	return F.cross_entropy(logit, target)
+	
+	def load_wav(self, wavfile, sr=16000):
+	wav, _ = librosa.load(wavfile, sr=sr, mono=True)
+	return wav_padding(wav, sr=16000, frame_period=5, multiple = 4)
+	
+	def train(self):
+	"""Train StarGAN."""
+	# Set data loader.
+	train_loader = self.train_loader
+	data_iter = iter(train_loader)
+	
+	# Read a batch of testdata
+	test_wavfiles = self.test_loader.get_batch_test_data(batch_size=4)
+	test_wavs = [self.load_wav(wavfile) for wavfile in test_wavfiles]
+	
+	# Determine whether do copysynthesize when first do training-time conversion test.
+	cpsyn_flag = [True, False][0]
+	# f0, timeaxis, sp, ap = world_decompose(wav = wav, fs = sampling_rate, frame_period = frame_period)
+	
+	# Learning rate cache for decaying.
+	g_lr = self.g_lr
+	d_lr = self.d_lr
+	
+	# Start training from scratch or resume training.
+	start_iters = 0
+	if self.resume_iters is not None:
+	print("resuming step %d ..."% self.resume_iters)
+	start_iters = self.resume_iters
+	self.restore_model(self.resume_iters)
+	
+	# Start training.
+	print('Start training...')
+	start_time = time.time()
+	for i in range(start_iters, self.num_iters):
+	# =================================================================================== #
+	# 1. Preprocess input data #
+	# =================================================================================== #
+	
+	# Fetch labels.
+	try:
+	mc_real, spk_label_org, spk_c_org = next(data_iter)
+	except:
+	data_iter = iter(train_loader)
+	mc_real, spk_label_org, spk_c_org = next(data_iter)
+	
+	mc_real.unsqueeze_(1) # (B, D, T) -> (B, 1, D, T) for conv2d
+	
+	# Generate target domain labels randomly.
+	# spk_label_trg: int, spk_c_trg:one-hot representation
+	spk_label_trg, spk_c_trg = self.sample_spk_c(mc_real.size(0))
+	
+	mc_real = mc_real.to(self.device) # Input mc.
+	spk_label_org = spk_label_org.to(self.device) # Original spk labels.
+	spk_c_org = spk_c_org.to(self.device) # Original spk one-hot.
+	spk_label_trg = spk_label_trg.to(self.device) # Target spk labels.
+	spk_c_trg = spk_c_trg.to(self.device) # Target spk one-hot.
+	
+	# =================================================================================== #
+	# 2. Train the Discriminator #
+	# =================================================================================== #
+	
+	# Compute loss with real mc feats.
+	d_out_src = self.discriminator(mc_real, spk_c_trg, spk_c_org)
+	d_loss_real = torch.mean((1.0 - d_out_src) ** 2)
+	
+	# Compute loss with fake mc feats.
+	mc_fake = self.generator(mc_real, spk_c_trg)
+	d_out_fake = self.discriminator(mc_fake.detach(), spk_c_org, spk_c_trg)
+	d_loss_fake = torch.mean(d_out_fake ** 2)
+	
+	# Backward and optimize.
+	d_loss = d_loss_real + d_loss_fake # + self.lambda_gp * d_loss_gp
+	self.reset_grad()
+	d_loss.backward()
+	self.d_optimizer.step()
+	
+	# Logging.
+	loss = {}
+	loss['D/loss_real'] = d_loss_real.item()
+	loss['D/loss_fake'] = d_loss_fake.item()
+	loss['D/loss'] = d_loss.item()
+	
+	# =================================================================================== #
+	# 3. Train the generator #
+	# =================================================================================== #
+	
+	if (i+1) % self.n_critic == 0:
+	# Original-to-target domain.
+	mc_fake = self.generator(mc_real, spk_c_trg)
+	g_out_src = self.discriminator(mc_fake, spk_c_org, spk_c_trg)
+	g_loss_fake = torch.mean((1.0 - g_out_src) ** 2)
+	
+	# Target-to-original domain. Cycle-consistent.
+	mc_reconst = self.generator(mc_fake, spk_c_org)
+	g_loss_rec = torch.mean(torch.abs(mc_real - mc_reconst))
+	
+	# Original-to-original, Id mapping loss. Mapping
+	mc_fake_id = self.generator(mc_real, spk_c_org)
+	g_loss_id = torch.mean(torch.abs(mc_real - mc_fake_id))
+	
+	# Backward and optimize.
+	if i > 10000:
+	self.lambda_id = 0
+	
+	g_loss = g_loss_fake \
+	+ self.lambda_rec * g_loss_rec \
+	+ self.lambda_id * g_loss_id
+	
+	self.reset_grad()
+	g_loss.backward()
+	self.g_optimizer.step()
+	
+	# Logging.
+	loss['G/loss_fake'] = g_loss_fake.item()
+	loss['G/loss_rec'] = g_loss_rec.item()
+	loss['G/loss_id'] = g_loss_id.item()
+	loss['G/loss'] = g_loss.item()
+	
+	# =================================================================================== #
+	# 4. Miscellaneous #
+	# =================================================================================== #
+	
+	# Print out training information.
+	if (i+1) % self.log_step == 0:
+	et = time.time() - start_time
+	et = str(datetime.timedelta(seconds=et))[:-7]
+	log = "Elapsed [{}], Iteration [{}/{}]".format(et, i+1, self.num_iters)
+	for tag, value in loss.items():
+	log += ", {}: {:.4f}".format(tag, value)
+	print(log)
+	self.log_loss_tensorboard(loss, i+1)
+	
+	if (i+1) % self.sample_step == 0:
+	sampling_rate = 16000
+	num_mcep = 36
+	frame_period = 5
+	with torch.no_grad():
+	for idx, wav in tqdm(enumerate(test_wavs)):
+	wav_name = basename(test_wavfiles[idx])
+	# print(wav_name)
+	f0, timeaxis, sp, ap = world_decompose(wav=wav, fs=sampling_rate, frame_period=frame_period)
+	f0_converted = pitch_conversion(f0=f0,
+	mean_log_src=self.test_loader.logf0s_mean_src, std_log_src=self.test_loader.logf0s_std_src,
+	mean_log_target=self.test_loader.logf0s_mean_trg, std_log_target=self.test_loader.logf0s_std_trg)
+	coded_sp = world_encode_spectral_envelop(sp=sp, fs=sampling_rate, dim=num_mcep)
+	
+	coded_sp_norm = (coded_sp - self.test_loader.mcep_mean_src) / self.test_loader.mcep_std_src
+	coded_sp_norm_tensor = torch.FloatTensor(coded_sp_norm.T).unsqueeze_(0).unsqueeze_(1).to(self.device)
+	conds = torch.FloatTensor(self.test_loader.spk_c_trg).to(self.device)
+	
+	# Include org_conds if using src and target domain codes.
+	# org_conds = torch.FloatTensor(self.test_loader.spk_c_org).to(self.device)
+	
+	coded_sp_converted_norm = self.generator(coded_sp_norm_tensor, conds).data.cpu().numpy()
+	coded_sp_converted = np.squeeze(coded_sp_converted_norm).T * self.test_loader.mcep_std_trg + self.test_loader.mcep_mean_trg
+	coded_sp_converted = np.ascontiguousarray(coded_sp_converted)
+	# decoded_sp_converted = world_decode_spectral_envelop(coded_sp = coded_sp_converted, fs = sampling_rate)
+	wav_transformed = world_speech_synthesis(f0=f0_converted, coded_sp=coded_sp_converted,
+	ap=ap, fs=sampling_rate, frame_period=frame_period)
+	
+	librosa.output.write_wav(
+	join(self.sample_dir, str(i+1)+'-'+wav_name.split('.')[0]+'-vcto-{}'.format(self.test_loader.trg_spk)+'.wav'), wav_transformed, sampling_rate)
+	if cpsyn_flag:
+	wav_cpsyn = world_speech_synthesis(f0=f0, coded_sp=coded_sp,
+	ap=ap, fs=sampling_rate, frame_period=frame_period)
+	librosa.output.write_wav(join(self.sample_dir, 'cpsyn-'+wav_name), wav_cpsyn, sampling_rate)
+	cpsyn_flag = False
+	
+	# Save model checkpoints.
+	if (i+1) % self.model_save_step == 0:
+	g_path = os.path.join(self.model_save_dir, '{}-G.ckpt'.format(i+1))
+	d_path = os.path.join(self.model_save_dir, '{}-D.ckpt'.format(i+1))
+	
+	torch.save(self.generator.state_dict(), g_path)
+	torch.save(self.discriminator.state_dict(), d_path)
+	print('Saved model checkpoints into {}...'.format(self.model_save_dir))
+	
+	# Decay learning rates.
+	if (i+1) % self.lr_update_step == 0 and (i+1) > (self.num_iters - self.num_iters_decay):
+	g_lr -= (self.g_lr / float(self.num_iters_decay))
+	d_lr -= (self.d_lr / float(self.num_iters_decay))
+	self.update_lr(g_lr, d_lr)
+	print('Decayed learning rates, g_lr: {}, d_lr: {}'.format(g_lr, d_lr))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import librosa
+	import numpy as np
+	import os
+	import pyworld
+	
+	
+	def load_wav(wav_file, sr):
+	wav, _ = librosa.load(wav_file, sr=sr, mono=True)
+	
+	return wav
+	
+	
+	def world_decompose(wav, fs, frame_period=5.0):
+	# Decompose speech signal into f0, spectral envelope and aperiodicity using WORLD
+	wav = wav.astype(np.float64)
+	f0, timeaxis = pyworld.harvest(wav, fs, frame_period=frame_period, f0_floor=71.0, f0_ceil=800.0)
+	sp = pyworld.cheaptrick(wav, f0, timeaxis, fs)
+	ap = pyworld.d4c(wav, f0, timeaxis, fs)
+	
+	return f0, timeaxis, sp, ap
+	
+	
+	def world_encode_spectral_envelop(sp, fs, dim=36):
+	# Get Mel-cepstral coefficients (MCEPs)
+	# sp = sp.astype(np.float64)
+	coded_sp = pyworld.code_spectral_envelope(sp, fs, dim)
+	
+	return coded_sp
+	
+	
+	def world_decode_spectral_envelop(coded_sp, fs):
+	# Decode Mel-cepstral to sp
+	fftlen = pyworld.get_cheaptrick_fft_size(fs)
+	decoded_sp = pyworld.decode_spectral_envelope(coded_sp, fs, fftlen)
+	
+	return decoded_sp
+	
+	
+	def world_encode_wav(wav_file, fs, frame_period=5.0, coded_dim=36):
+	wav = load_wav(wav_file, sr=fs)
+	f0, timeaxis, sp, ap = world_decompose(wav=wav, fs=fs, frame_period=frame_period)
+	coded_sp = world_encode_spectral_envelop(sp=sp, fs=fs, dim=coded_dim)
+	
+	return f0, timeaxis, sp, ap, coded_sp
+	
+	
+	def world_speech_synthesis(f0, coded_sp, ap, fs, frame_period):
+	decoded_sp = world_decode_spectral_envelop(coded_sp, fs)
+	min_len = min([len(f0), len(coded_sp), len(ap)])
+	f0 = f0[:min_len]
+	coded_sp = coded_sp[:min_len]
+	ap = ap[:min_len]
+	wav = pyworld.synthesize(f0, decoded_sp, ap, fs, frame_period)
+	# Librosa could not save wav if not doing so
+	wav = wav.astype(np.float32)
+	
+	return wav
+	
+	
+	def world_synthesis_data(f0s, coded_sps, aps, fs, frame_period):
+	wavs = list()
+	for f0, decoded_sp, ap in zip(f0s, coded_sps, aps):
+	wav = world_speech_synthesis(f0, decoded_sp, ap, fs, frame_period)
+	wavs.append(wav)
+	
+	return wavs
+	
+	
+	def coded_sps_normalization_fit_transoform(coded_sps):
+	coded_sps_concatenated = np.concatenate(coded_sps, axis=1)
+	coded_sps_mean = np.mean(coded_sps_concatenated, axis=1, keepdims=True)
+	coded_sps_std = np.std(coded_sps_concatenated, axis=1, keepdims=True)
+	coded_sps_normalized = list()
+	for coded_sp in coded_sps:
+	coded_sps_normalized.append((coded_sp - coded_sps_mean) / coded_sps_std)
+	
+	return coded_sps_normalized, coded_sps_mean, coded_sps_std
+	
+	
+	def coded_sp_statistics(coded_sps):
+	# sp shape (T, D)
+	coded_sps_concatenated = np.concatenate(coded_sps, axis=0)
+	coded_sps_mean = np.mean(coded_sps_concatenated, axis=0, keepdims=False)
+	coded_sps_std = np.std(coded_sps_concatenated, axis=0, keepdims=False)
+	
+	return coded_sps_mean, coded_sps_std
+	
+	
+	def normalize_coded_sp(coded_sp, coded_sp_mean, coded_sp_std):
+	normed = (coded_sp - coded_sp_mean) / coded_sp_std
+	
+	return normed
+	
+	
+	def coded_sps_normalization_transoform(coded_sps, coded_sps_mean, coded_sps_std):
+	coded_sps_normalized = list()
+	for coded_sp in coded_sps:
+	coded_sps_normalized.append((coded_sp - coded_sps_mean) / coded_sps_std)
+	
+	return coded_sps_normalized
+	
+	
+	def coded_sps_normalization_inverse_transoform(normalized_coded_sps, coded_sps_mean, coded_sps_std):
+	coded_sps = list()
+	for normalized_coded_sp in normalized_coded_sps:
+	coded_sps.append(normalized_coded_sp * coded_sps_std + coded_sps_mean)
+	
+	return coded_sps
+	
+	
+	def coded_sp_padding(coded_sp, multiple=4):
+	num_features = coded_sp.shape[0]
+	num_frames = coded_sp.shape[1]
+	num_frames_padded = int(np.ceil(num_frames / multiple)) * multiple
+	num_frames_diff = num_frames_padded - num_frames
+	num_pad_left = num_frames_diff // 2
+	num_pad_right = num_frames_diff - num_pad_left
+	coded_sp_padded = np.pad(coded_sp, ((0, 0), (num_pad_left, num_pad_right)), 'constant', constant_values=0)
+	return coded_sp_padded
+	
+	
+	def wav_padding(wav, sr, frame_period, multiple=4):
+	assert wav.ndim == 1
+	num_frames = len(wav)
+	num_frames_padded = int(
+	(np.ceil((np.floor(num_frames / (sr * frame_period / 1000)) + 1) / multiple + 1) * multiple - 1) * (
+	sr * frame_period / 1000))
+	num_frames_diff = num_frames_padded - num_frames
+	num_pad_left = num_frames_diff // 2
+	num_pad_right = num_frames_diff - num_pad_left
+	wav_padded = np.pad(wav, (num_pad_left, num_pad_right), 'constant', constant_values=0)
+	
+	return wav_padded
+	
+	
+	def logf0_statistics(f0s):
+	log_f0s_concatenated = np.ma.log(np.concatenate(f0s))
+	log_f0s_mean = log_f0s_concatenated.mean()
+	log_f0s_std = log_f0s_concatenated.std()
+	
+	return log_f0s_mean, log_f0s_std
+	
+	
+	def pitch_conversion(f0, mean_log_src, std_log_src, mean_log_target, std_log_target):
+	# Logarithm Gaussian normalization for Pitch Conversions
+	f0_converted = np.exp((np.ma.log(f0) - mean_log_src) / std_log_src * std_log_target + mean_log_target)
+	
+	return f0_converted
+	
+	
+	def wavs_to_specs(wavs, n_fft=1024, hop_length=None):
+	stfts = list()
+	for wav in wavs:
+	stft = librosa.stft(wav, n_fft=n_fft, hop_length=hop_length)
+	stfts.append(stft)
+	
+	return stfts
+	
+	
+	def wavs_to_mfccs(wavs, sr, n_fft=1024, hop_length=None, n_mels=128, n_mfcc=24):
+	mfccs = list()
+	for wav in wavs:
+	mfcc = librosa.feature.mfcc(y=wav, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels, n_mfcc=n_mfcc)
+	mfccs.append(mfcc)
+	
+	return mfccs
+	
+	
+	def mfccs_normalization(mfccs):
+	mfccs_concatenated = np.concatenate(mfccs, axis=1)
+	mfccs_mean = np.mean(mfccs_concatenated, axis=1, keepdims=True)
+	mfccs_std = np.std(mfccs_concatenated, axis=1, keepdims=True)
+	
+	mfccs_normalized = list()
+	for mfcc in mfccs:
+	mfccs_normalized.append((mfcc - mfccs_mean) / mfccs_std)
+	
+	return mfccs_normalized, mfccs_mean, mfccs_std
+
