@@ -1,0 +1,4 @@
+
+To advance the research on multi-domain non-parallel VC, the conditional algorithms in StarGAN-VC have been rethought in two aspects: training objectives and network architectures. We developed a source-target conditional adversarial loss for the former and a modulation-based conditional method for the latter and proposed StarGAN-VC2 by combining them. Experimental studies on non-parallel multi-speaker VC show that StarGAN-VC2 outperforms StarGAN-VC in both objective and subjective criteria. StarGAN-VC2 is a general model for multi-domain VC and is not limited to multi-speaker VC.
+Adapting it to other tasks (eg, multi-emotional VC and multi-pronunciation VC) remains a promising future direction.
+
